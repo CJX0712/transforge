@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (${{ matrix.os }}, py${{ matrix.py }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        py: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.py }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+      # The layering contract (cli -> pipeline -> {data,solvers,adapt,eval} -> core)
+      # is enforced by a test, which is cheaper and stricter than import-linter here.
+      - name: Architecture (no import cycles)
+        run: python -m pytest tests/test_system.py::TestArchitecture -q
+
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.py }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        py: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.py }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run tests
+        run: python -m pytest -q -W ignore::UserWarning --cov=transforge --cov-report=term
+      - name: Coverage gate (>=70%)
+        run: |
+          python -m coverage report --fail-under=70
+
+  invariants:
+    name: invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      # --strict makes any falsified invariant a non-zero exit: E500 is this
+      # project's signature "a conclusion was falsified", not "the program crashed".
+      - name: All invariants must hold
+        run: python -m transforge.cli invariant --strict
+
+  demo-smoke:
+    name: demo smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: End-to-end demo
+        run: python examples/run_demo.py --quick --out benchmark-smoke.json
+      - name: Determinism (bitwise, two independent processes)
+        run: python -m transforge.cli reproduce
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke-${{ github.run_id }}
+          path: benchmark-smoke.json
+
+  tier1-no-pot:
+    name: degraded mode (POT disabled)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install numpy scipy scikit-learn pytest
+      # Proves the "optional backend" promise is real: with no exact reference
+      # available the gates must report `skipped`, never invent a number.
+      - name: Invariants with POT disabled
+        env:
+          TRANSFORGE_DISABLE_POT: "1"
+        run: python -m transforge.cli invariant
+      - name: Demo with POT disabled
+        env:
+          TRANSFORGE_DISABLE_POT: "1"
+        run: python examples/run_demo.py --quick --out benchmark-nopot.json
+      - name: Output must declare the degradation
+        run: |
+          python - <<'PY'
+          import json, sys
+          d = json.load(open("benchmark-nopot.json", encoding="utf-8"))
+          assert d["skipped"], "degraded run must record what it skipped"
+          assert not d["capabilities"]["POT"]["available"]
+          print("degradation correctly recorded:", d["skipped"])
+          PY
+
+  build:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: transforge:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
