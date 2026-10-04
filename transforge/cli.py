@@ -22,6 +22,7 @@ from pathlib import Path
 from .core.config import BENCH_SCALES, GATES, RunConfig
 from .core.errors import TransForgeError
 from .core.seed import set_all
+from .eval.report import core_metrics
 from .pipeline.backends import capability_report
 from .pipeline.runner import TransForgePipeline
 
@@ -182,12 +183,11 @@ def cmd_reproduce(args: argparse.Namespace, cfg: RunConfig) -> int:
         rep = TransForgePipeline(local).benchmark(
             seeds=[local.seed], scales=[1.0, 20.0], run_ablations=False
         )
-        d = rep.to_dict()
-        d["meta"].pop("elapsed_s", None)
-        for cell in d["cells"]:
-            for k in ("t_flagship", "t_oracle", "t_fixed"):
-                cell.pop(k, None)
-        payloads.append(d)
+        # Use the shared core_metrics() stripper instead of an ad-hoc key list.
+        # The old inline version only removed meta.elapsed_s and three cell keys,
+        # so gates[].time_ratio and other wall-clock fields survived and the
+        # bitwise comparison failed on machine load alone (invariant I9).
+        payloads.append(core_metrics(rep.to_dict()))
     a = json.dumps(payloads[0], sort_keys=True, ensure_ascii=False)
     b = json.dumps(payloads[1], sort_keys=True, ensure_ascii=False)
     same = a == b
